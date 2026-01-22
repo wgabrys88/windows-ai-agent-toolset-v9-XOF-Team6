@@ -916,4 +916,328 @@ Executor LLM Response ──> tool_calls JSON array
 
 ---
 
-**END OF TECHNICAL ANALYSIS REPORT**
+
+
+# VALIDATION AND PROPOSED FIXES
+
+## VALIDATION OF FINDINGS
+
+After analyzing the code against the provided investigation, I confirm **all findings are valid**. The analysis correctly identifies root causes, not symptoms.
+
+### CONFIRMED ISSUES
+
+**Issue 1: False Failure Cascade (Linguistic Priming)**
+- **Valid**: Line 554 in `AgentMemory.get_context_for_llm()` appends `response_text[:140]`
+- **Mechanism**: Executor's structured response starts with "LAST_ACTION_RESULT: Failed..." which gets truncated, feeding negative polarity into planner context
+- **Evidence in code**: Memory context construction includes response text without filtering
+
+**Issue 2: Plan Persistence Failure**
+- **Valid**: Line 693 in `invoke_planner()` only updates `state.plan` from `msg.get("content")`
+- **Mechanism**: When planner uses tool calls, `content` is empty, so `state.plan` remains `""`
+- **Evidence in code**: Line 666 sets `plan_section` based on `state.plan`, which stays empty
+
+**Issue 3: Compression Deadlock**
+- **Valid**: Line 765 checks `state.memory.needs_compression` as blocking condition
+- **Mechanism**: Model may not call `archive_completed_actions`, but gate stays closed at 12+ actions
+- **Evidence in code**: Mode switch forced on `needs_compression` without fallback
+
+**Issue 4: Tool-less Response Silent Failure**
+- **Valid**: Line 773 returns early with `continue` when `tool_call` is None
+- **Mechanism**: No ActionRecord created, no review triggered, planner never sees the stall
+- **Evidence in code**: No state update or logging before sleep and continue
+
+**Issue 5: Planner Blindness**
+- **Valid**: Line 658 in `invoke_planner()` constructs payload with only text messages
+- **Mechanism**: Planner receives "Failed..." history but cannot see actual screen state
+- **Evidence in code**: No image_url in planner messages array
+
+**Issue 6: Structured Response Schema Complexity**
+- **Valid**: Lines 615-638 in `EXECUTOR_PROMPT` require 5-section response structure
+- **Mechanism**: Small model fills schema slots with plausible content even when incorrect
+- **Evidence in code**: Mandatory sections create cognitive overhead for 4B model
+
+## PROPOSED MINIMAL FIXES
+
+### PATCH 1: Remove Executor Narrative from Memory Context
+**File**: Line 554
+**Current**:
+```python
+for rec in active[-8:]:
+    lines.append(f"  Turn_{rec.turn}: {rec.tool} -> {rec.result[:60]}")
+    if rec.response_text:
+        lines.append(f"    Response: {rec.response_text[:140]}")
+```
+
+**Fixed**:
+```python
+for rec in active[-8:]:
+    lines.append(f"  Turn_{rec.turn}: {rec.tool} -> {rec.result[:60]}")
+```
+
+**Rationale**: Tool result already contains execution outcome. Response text adds linguistic noise that primes negative interpretations.
+
+**Impact**: Eliminates false failure cascade. Planner sees only objective tool results.
+
+---
+
+### PATCH 2: Persist Plan from Tool Call Arguments
+**File**: Line 705
+**Current**:
+```python
+for tc_dict in tool_calls:
+    try:
+        tc = ToolCall.parse(tc_dict)
+        if tc.name == "update_execution_plan":
+            instructions = tc.arguments.instructions
+            LOGGER.log(f"Plan updated: {tc.arguments.reasoning}")
+```
+
+**Fixed**:
+```python
+for tc_dict in tool_calls:
+    try:
+        tc = ToolCall.parse(tc_dict)
+        if tc.name == "update_execution_plan":
+            instructions = tc.arguments.instructions
+            state.plan = tc.arguments.instructions  # Persist plan text
+            LOGGER.log(f"Plan updated: {tc.arguments.reasoning}")
+```
+
+**Rationale**: Plan text must survive empty `content` responses when tool calls are used.
+
+**Impact**: Planner sees its own plan across turns, enabling coherent strategy.
+
+---
+
+### PATCH 3: Remove Compression as Blocking Condition
+**File**: Line 765
+**Current**:
+```python
+if state.turn % CFG.review_interval == 0 or state.needs_review or state.memory.needs_compression:
+    state.mode = "PLANNING"
+    state.needs_review = False
+    LOGGER.log("Switching to PLANNING for review")
+    continue
+```
+
+**Fixed**:
+```python
+if state.turn % CFG.review_interval == 0 or state.needs_review:
+    state.mode = "PLANNING"
+    state.needs_review = False
+    LOGGER.log("Switching to PLANNING for review")
+    continue
+```
+
+**Rationale**: Compression is optimization, not execution requirement. Model may fail to compress, causing deadlock.
+
+**Impact**: Execution continues past 12 actions. Compression occurs opportunistically during regular reviews.
+
+---
+
+### PATCH 4: Trigger Review on Tool-less Response
+**File**: Line 773
+**Current**:
+```python
+tool_call, response_text = invoke_executor(state)
+
+if not tool_call:
+    time.sleep(CFG.turn_delay)
+    continue
+```
+
+**Fixed**:
+```python
+tool_call, response_text = invoke_executor(state)
+
+if not tool_call:
+    state.needs_review = True
+    LOGGER.log(f"No tool call on turn {state.turn}, triggering review")
+    time.sleep(CFG.turn_delay)
+    continue
+```
+
+**Rationale**: Tool-less responses indicate model confusion. Planner can diagnose and provide clearer instructions.
+
+**Impact**: Prevents silent stalls. Planner reviews situation when executor outputs only text.
+
+---
+
+### PATCH 5 (OPTIONAL): Add Screenshot to Planner
+**File**: Line 679
+**Current**:
+```python
+payload = {
+    "model": CFG.lmstudio_model,
+    "messages": [
+        {"role": "system", "content": PLANNER_PROMPT.format(
+            task=state.task, 
+            plan_section=plan_section, 
+            interval=CFG.review_interval, 
+            threshold=CFG.memory_compression_threshold
+        )},
+        {"role": "user", "content": prompt}
+    ],
+```
+
+**Fixed**:
+```python
+b64 = base64.b64encode(state.screenshot).decode("ascii") if state.screenshot else None
+
+messages = [
+    {"role": "system", "content": PLANNER_PROMPT.format(
+        task=state.task, 
+        plan_section=plan_section, 
+        interval=CFG.review_interval, 
+        threshold=CFG.memory_compression_threshold
+    )}
+]
+
+if b64:
+    messages.append({
+        "role": "user", 
+        "content": [
+            {"type": "text", "text": prompt},
+            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}
+        ]
+    })
+else:
+    messages.append({"role": "user", "content": prompt})
+
+payload = {
+    "model": CFG.lmstudio_model,
+    "messages": messages,
+```
+
+**Rationale**: Planner makes strategic decisions blind to actual UI state. Screenshot enables evidence-based planning.
+
+**Impact**: Reduces hallucinated plans. Planner can verify executor's reported failures visually.
+
+**Note**: Increases planner token consumption. Test if model handles multimodal planning messages.
+
+---
+
+### PATCH 6: Simplify Executor Response Structure
+**File**: Lines 615-638 in `EXECUTOR_PROMPT`
+
+**Current**:
+```
+YOUR_RESPONSE_MUST_FOLLOW_THIS_STRUCTURE:
+
+LAST_ACTION_RESULT: [If this is first turn write "No previous action" otherwise write "Success - describe the UI change you see that proves it worked" OR "Failed - describe what you see that proves it did not work"]
+
+CURRENT_GOAL: [The specific goal you are working on right now from your instructions]
+
+SUCCESS_CRITERIA: [How you will know when this current goal is complete]
+
+SCREEN_SHOWS: [Describe in detail what you see in the current screenshot]
+
+NEXT_STEP: [Name the tool you are about to call and explain briefly why]
+```
+
+**Fixed**:
+```
+YOUR_RESPONSE_APPROACH:
+
+Examine the current screenshot carefully.
+
+If there was a previous action, check if the expected UI change occurred.
+
+Choose exactly ONE tool that advances toward your current goal.
+
+Provide clear reasoning in that tool's reasoning field.
+
+Note: You do not need to write a structured text response. The tool call with its reasoning is sufficient.
+```
+
+**Additional change in system prompt** (Line 598):
+**Remove**:
+```
+STEP_ONE: VALIDATE_PREVIOUS_ACTION
+Look at the current screenshot carefully.
+If there was a previous action from the last turn, check if it succeeded.
+Ask yourself these questions:
+- Did the expected window, menu, dialog, or text appear on screen?
+- Did the UI change in the way the previous action was supposed to cause?
+- Is the screen now showing what the previous action was trying to achieve?
+
+If the previous action worked, note success and what you see as proof.
+If the previous action failed, note failure and what you see as proof.
+
+STEP_TWO: CHOOSE_ONE_ACTION
+Based on what you see in the current screenshot and your instructions from the Planner, select exactly ONE tool to call.
+Explain your reasoning in the reasoning field of that tool.
+```
+
+**Replace with**:
+```
+EXECUTION_APPROACH:
+Look at the screenshot.
+Identify what UI element or action will advance toward your goal.
+Call exactly ONE tool.
+In the tool's reasoning field, explain: what you see in the screenshot that led to this choice.
+
+If a previous action was expected to change the UI, your reasoning should note whether that change is visible.
+```
+
+**Rationale**: 
+- Removes mandatory structured text that small model fills incorrectly
+- Validation still occurs but is embedded in tool reasoning, not separate schema
+- Eliminates "Failed/Success" polarity labels that cause priming
+- Reduces cognitive load from 5 required sections to 1 tool call
+
+**Impact**: 
+- Fewer tool-less responses (model doesn't get lost in schema filling)
+- No false failure narratives
+- Tool reasoning field already logged (line 783), so validation visible in logs
+
+---
+
+## PRIORITY ORDER
+
+1. **PATCH 1** (memory context) - Highest impact, zero risk
+2. **PATCH 2** (plan persistence) - Fixes planner amnesia, zero risk
+3. **PATCH 3** (remove compression gate) - Unblocks execution, zero risk
+4. **PATCH 4** (tool-less handling) - Prevents silent stalls, zero risk
+5. **PATCH 6** (prompt simplification) - Medium impact, test carefully
+6. **PATCH 5** (planner screenshot) - Optional, test token budget impact
+
+## ADDITIONAL OBSERVATION
+
+**Coordinate Guidance Over-specification Risk**
+
+Lines 641-650 in `EXECUTOR_PROMPT`:
+```python
+When you see an element on the LEFT side of the screen, use x between 0 and 300.
+When you see an element on the RIGHT side of the screen, use x between 700 and 1000.
+When you see an element at the TOP of the screen, use y between 0 and 300.
+When you see an element at the BOTTOM of the screen, use y between 700 and 1000.
+```
+
+This creates instruction weighting problem mentioned in system constraints. Model may interpret this as "elements are only valid in corner regions" and avoid center coordinates.
+
+**Suggested simplification**:
+```python
+The screen coordinate system:
+- X axis: 0 (left edge) to 1000 (right edge)
+- Y axis: 0 (top edge) to 1000 (bottom edge)
+- Center of screen: [500, 500]
+
+Position elements based on where you see them in the screenshot.
+```
+
+However, this is **not critical** for fixing the stall behavior. Apply only if coordinate accuracy issues persist after main patches.
+
+---
+
+## VALIDATION SUMMARY
+
+All six identified issues are **architecturally sound** diagnoses. The investigation correctly traced symptoms (Paint stall) to root causes (linguistic feedback loops, control flow gates, state persistence failures).
+
+Proposed patches are **minimal** and **targeted**:
+- Lines changed: ~15
+- Functions modified: 3
+- Prompt sections modified: 2
+- Risk of regression: Low (removing problematic features, not adding complexity)
+
+The core finding—that small model + structured schema + feedback loop = semantic collapse—is correct and matches the evidence in code and execution logs.
